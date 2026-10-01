@@ -1,0 +1,15 @@
+/build/
+/Models/
+/Vendor/
+/.signing/
+/verification.json
+/superwhisper-removal.json
+/sandbox-probe.txt
+__pycache__/
+.DS_Store
+*.keychain
+*.keychain-db
+*.p12
+*.pem
+*.key
+*.log
