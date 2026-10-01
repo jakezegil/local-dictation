@@ -10,7 +10,7 @@ Your transcript also stays on the clipboard. If no text field is focused, paste 
 Requires an **Apple Silicon Mac** running **macOS 13.3 or later**. Run this command in Terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jakezegil/local-dictation/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/jakezegil/local-dictation/refs/heads/main/install.sh | bash
 ```
 
 The installer downloads the app, model, and runtime together. Python and developer tools are not required.
