@@ -42,7 +42,7 @@ trap cleanup EXIT
 printf 'Downloading Local Dictation %s…\n' "$version"
 /usr/bin/curl --fail --location --show-error --proto '=https' --tlsv1.2 --retry 3 \
     "$download_url" --output "$work/$archive_name"
-actual_sha256="$(/usr/bin/shasum -a 256 "$work/$archive_name")"
+actual_sha256="$(LC_ALL=C /usr/bin/shasum -a 256 "$work/$archive_name")"
 [[ "${actual_sha256%% *}" == "$expected_sha256" ]] || fail 'Download checksum mismatch. Installation stopped.'
 /usr/bin/ditto -x -k "$work/$archive_name" "$work/unpacked"
 downloaded="$work/unpacked/Local Dictation.app"
