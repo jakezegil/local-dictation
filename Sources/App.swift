@@ -15,6 +15,9 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var processing = false
     private var lastTranscript: String?
     private var limitTimer: Timer?
+    private var previewTimer: Timer?
+    private var recordingID: UUID?
+    private var previewInFlight = false
     private var permissionWindow: NSWindow?
     private var automaticInsertion: Bool {
         get { UserDefaults.standard.object(forKey: "automaticInsertion") as? Bool ?? true }
@@ -85,34 +88,64 @@ final class AppController: NSObject, NSApplicationDelegate {
         do {
             insertionTarget = NSWorkspace.shared.frontmostApplication
             try recorder.start()
+            recordingID = UUID()
+            previewInFlight = false
             recordingPanel.showRecording()
             recordItem.title = "Stop Recording"
             updateStatus("Recording — press Fn-Control to stop", symbol: "mic.fill")
             limitTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: false) { [weak self] _ in
                 self?.stopRecording()
             }
+            previewTimer = Timer.scheduledTimer(withTimeInterval: 1.1, repeats: true) { [weak self] _ in
+                self?.refreshPreview()
+            }
         } catch { showError(error) }
+    }
+
+    private func refreshPreview() {
+        guard let id = recordingID, recorder.isRecording, !previewInFlight, !processing else { return }
+        do {
+            guard let url = try recorder.snapshot() else { return }
+            previewInFlight = true
+            transcriber.transcribe(url, removingAudio: true) { [weak self] result in
+                guard let self, self.recordingID == id, self.recorder.isRecording else { return }
+                self.previewInFlight = false
+                switch result {
+                case .success(let text): self.recordingPanel.updatePreview(text)
+                case .failure: self.recordingPanel.previewUnavailable()
+                }
+            }
+        } catch { stopRecording() }
+    }
+
+    private func stopPreview() {
+        previewTimer?.invalidate()
+        previewTimer = nil
+        recordingID = nil
     }
 
     private func stopRecording() {
         limitTimer?.invalidate()
         limitTimer = nil
-        guard let url = recorder.stop() else { return }
+        stopPreview()
+        let url: URL
+        do {
+            guard let recording = try recorder.stop() else { return }
+            url = recording
+        } catch {
+            recordItem.title = "Start Recording"
+            showError(error)
+            return
+        }
         processing = true
         recordItem.title = "Start Recording"
         recordItem.isEnabled = false
         updateStatus("Transcribing locally…", symbol: "waveform")
         recordingPanel.showProcessing()
-        transcriber.transcribe(url) { [weak self] result in
+        transcriber.transcribe(url, removingAudio: true) { [weak self] result in
             guard let self else { return }
             self.recordItem.isEnabled = true
             self.recordingPanel.close()
-            do { try FileManager.default.removeItem(at: url) }
-            catch {
-                self.processing = false
-                self.showError(error)
-                return
-            }
             switch result {
             case .failure(let error):
                 self.processing = false
@@ -224,6 +257,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
         do { try recorder.cancel() }
         catch { showError(error); return }
+        stopPreview()
+        limitTimer?.invalidate()
         hotKey?.stop()
         transcriber.shutdown()
         NSApp.terminate(nil)
@@ -240,6 +275,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        stopPreview()
+        limitTimer?.invalidate()
         hotKey?.stop()
         transcriber.shutdown()
         try? recorder.cancel()

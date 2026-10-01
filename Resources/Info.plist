@@ -7,8 +7,8 @@
     <key>CFBundleDisplayName</key><string>Local Dictation</string>
     <key>CFBundleExecutable</key><string>LocalDictation</string>
     <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleVersion</key><string>2</string>
-    <key>CFBundleShortVersionString</key><string>0.2.0</string>
+    <key>CFBundleVersion</key><string>3</string>
+    <key>CFBundleShortVersionString</key><string>0.3.0</string>
     <key>LSMinimumSystemVersion</key><string>13.3</string>
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key><string>Local Dictation records your voice between presses of Fn-Control. Audio stays on this Mac and is deleted after transcription.</string>

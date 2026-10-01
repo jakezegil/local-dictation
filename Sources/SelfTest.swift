@@ -62,6 +62,7 @@ enum SelfTest {
         try Data("private temporary file".utf8).write(to: temporaryProbe)
         try FileManager.default.removeItem(at: temporaryProbe)
         checks["private_temporary_directory_accessible"] = true
+        checks["live_preview"] = try PreviewTest.run(sample: sample, transcriber: engine)
         let workerChecks = try engine.sandboxChecks(probePath: probePath)
         guard workerChecks["network_denied"] as? Bool == true,
               workerChecks["unrelated_file_read_denied"] as? Bool == true else {

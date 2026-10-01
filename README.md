@@ -2,7 +2,8 @@
 
 A Mac menu bar app for offline English dictation with [Phonon 2](https://www.fermionresearch.com/research/phonon-2/).
 
-Press **Fn-Control** to open the recording box. Press it again to transcribe, close the box, and paste.
+Press **Fn-Control** to open the recording box and see a live transcript preview.
+Press it again to finish the full transcript, close the box, and paste.
 Your transcript also stays on the clipboard. If no text field is focused, paste later with **Command-V**.
 
 ## Install
@@ -10,7 +11,7 @@ Your transcript also stays on the clipboard. If no text field is focused, paste 
 Requires an **Apple Silicon Mac** running **macOS 13.3 or later**. Run this command in Terminal:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/jakezegil/local-dictation/refs/heads/main/install.sh | bash
+curl -fsSL https://github.com/jakezegil/local-dictation/releases/latest/download/install.sh | bash
 ```
 
 The installer downloads the app, model, and runtime together. Python and developer tools are not required.
@@ -31,7 +32,9 @@ You can [read the installer](install.sh) or [download the release](https://githu
 6. Press **Fn-Control**, speak, and press **Fn-Control** again.
 
 The model takes about 15 seconds to load on the tested Mac. Later recordings use the loaded model.
-The recording box leaves your text field focused. Recordings stop automatically after ten minutes.
+The recording box leaves your text field focused. Its preview refreshes about once a second with the last 20 seconds.
+Preview text may change as you speak. The final transcript includes the full recording.
+Only one preview runs at a time. Recordings stop automatically after ten minutes.
 
 The microphone icon in the menu bar provides recording, clipboard, insertion, permission, and quit controls.
 To reopen the app, use Spotlight: **Command-Space → Local Dictation → Return**.
@@ -50,7 +53,8 @@ The shortcut observes modifier changes only. It does not capture typed character
 The app remembers the active application without inspecting its contents.
 Automatic insertion restores that application and posts **Command-V** after you release the shortcut.
 
-Audio stays in the app's private temporary directory and is deleted after transcription, including failures.
+Audio and preview snapshots stay in the app's private temporary directory.
+The app deletes each preview snapshot after use and deletes the full recording after transcription, including failures.
 The app removes abandoned recordings when it starts. The last transcript stays in memory until you quit.
 The system clipboard retains the transcript. Other clipboard tools may read or sync it.
 
@@ -97,6 +101,7 @@ Otherwise, it uses an ad-hoc signature. Private signing files are excluded from 
 To package a release from a development setup, run `python3 release.py`.
 It creates an ad-hoc signed app, a ZIP archive, and `SHA256SUMS.txt` in `build/release`.
 Update the version and pinned archive checksum in `install.sh` before publishing the next release.
+Attach `install.sh`, the ZIP archive, and `SHA256SUMS.txt` to the release.
 
 ## Verify
 
@@ -108,6 +113,8 @@ printf 'sandbox probe\n' > sandbox-probe.txt
 ```
 
 The self-test transcribes a bundled generated speech sample and checks clipboard output.
+It checks live preview transcription before the recording closes, microphone-format resampling, and the bounded preview window.
+It verifies that the complete recording remains available for the final transcript.
 It checks that both processes deny network access and access to the unrelated probe file.
 It reports event-posting permission separately and replaces the clipboard with the sample transcript.
 The Fn-Control toggle and automatic insertion have also been confirmed during normal use.

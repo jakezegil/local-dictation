@@ -10,9 +10,9 @@ os_rest="${os_version#*.}"
 os_minor="${os_rest%%.*}"
 (( os_major > 13 || (os_major == 13 && os_minor >= 3) )) || fail 'Local Dictation requires macOS 13.3 or later.'
 
-version='0.2.0'
+version='0.3.0'
 archive_name="Local-Dictation-${version}-arm64.zip"
-expected_sha256='21cbecb9b4c94f93cab9bb76b02ec07357af70439f83f403937d0abdc2523500'
+expected_sha256='cc294209a5c8f50e04793a558d26a81777adbae79df018b86b63af8aebfd023e'
 download_url="https://github.com/jakezegil/local-dictation/releases/download/v${version}/${archive_name}"
 install_dir="${LOCAL_DICTATION_INSTALL_DIR:-/Applications}"
 if [[ -z "${LOCAL_DICTATION_INSTALL_DIR:-}" && ! -w /Applications ]]; then

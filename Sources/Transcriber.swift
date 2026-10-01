@@ -31,9 +31,13 @@ final class Transcriber {
         }
     }
 
-    func transcribe(_ url: URL, completion: @escaping (Result<String, Error>) -> Void) {
+    func transcribe(_ url: URL, removingAudio: Bool = false, completion: @escaping (Result<String, Error>) -> Void) {
         queue.async {
-            let result = Result { try self.transcribeSynchronously(url) }
+            var result = Result { try self.transcribeSynchronously(url) }
+            if removingAudio {
+                do { try FileManager.default.removeItem(at: url) }
+                catch { result = .failure(error) }
+            }
             DispatchQueue.main.async { completion(result) }
         }
     }
