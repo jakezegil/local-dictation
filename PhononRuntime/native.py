@@ -2,31 +2,47 @@
 # Adapted from Fermion Research fermion-research 0.2.7. See Resources/Licenses.txt.
 """Phonon 2 native CPU bindings, adapted from fermion-research 0.2.7 (Apache-2.0)."""
 import ctypes
+import hashlib
+from concurrent.futures import ThreadPoolExecutor
 import json
+import mmap
+import os
 from pathlib import Path
 
 import numpy as np
 
 import fermion_container as container
 
+# Bump when the cached layout or the decoding below changes.
+CACHE_VERSION = 1
+CACHE_MAGIC = b"PHN2CACH"
+
 
 class Engine:
-    def __init__(self, model_dir, library_dir, threads=4):
+    def __init__(self, model_dir, library_dir, threads=4, cache_dir=None):
         model_dir = Path(model_dir)
         self.config = json.loads((model_dir / "config.json").read_text())
         self.vocabulary = self.config["joint"]["vocabulary"]
         self.encoder = None
         self.decoder = None
         self.matrices = {}
-        self.matrix_data = []
+        self.decoder_data = []
+        self.cache_hit = False
         self.enc_lib = ctypes.CDLL(str(Path(library_dir) / "libphonon2_enc-macos-arm64.dylib"))
         self.tdt_lib = ctypes.CDLL(str(Path(library_dir) / "libphonon2_tdt-macos-arm64.dylib"))
         self._configure_libraries(threads)
-        tensors, raw = self._read_weights(model_dir / "model.fermion")
-        self._create_encoder(tensors)
-        self._create_decoder(tensors, raw, threads)
-        self.projector = np.ascontiguousarray(tensors["encoder_projector.weight"], dtype=np.float32)
-        self.projector_bias = np.ascontiguousarray(tensors["encoder_projector.bias"], dtype=np.float32)
+        try:
+            matrices, tensors, raw = self._load_weights(model_dir / "model.fermion", cache_dir)
+            self._create_matrices(matrices)
+            # The native library copies matrix data, so the packed planes can be released now.
+            del matrices
+            self._create_encoder(tensors)
+            self._create_decoder(tensors, raw, threads)
+            self.projector = np.array(tensors["encoder_projector.weight"], dtype=np.float32, order="C")
+            self.projector_bias = np.array(tensors["encoder_projector.bias"], dtype=np.float32, order="C")
+        except BaseException:
+            self.close()
+            raise
         self.filters = mel_filters()
         self.window = np.pad(np.hanning(400).astype(np.float32), (56, 56))
 
@@ -65,49 +81,38 @@ class Engine:
         lib.phonon2_tdt_decode.restype = ctypes.c_int
         lib.phonon2_tdt_destroy.argtypes = [ctypes.c_void_p]
 
-    def _read_weights(self, path):
-        tensors, raw = {}, {}
-        with open(path, "rb") as file:
-            header_size = int.from_bytes(file.read(8), "little")
-            header = json.loads(file.read(header_size))
-            if header["format"] != container.FORMAT:
-                raise RuntimeError("Unsupported Phonon model format")
-            for entry in header["index"]:
-                blob = file.read(entry["b"])
-                if len(blob) != entry["b"]:
-                    raise RuntimeError("Truncated Phonon weights")
-                name, kind, shape = entry["n"], entry["k"], tuple(entry["shape"])
-                if kind == "five_value":
-                    record = {}
-                    container._five_value(blob, shape, record)
-                    self.matrices[name] = self._create_matrix(record)
-                elif kind.startswith("int"):
-                    record = {}
-                    tensors[name] = container._intn(blob, shape, int(kind[3:]), record)
-                    raw[name] = record
-                elif kind == "fp16":
-                    tensors[name] = np.frombuffer(blob, dtype=np.float16).reshape(shape).copy()
-                else:
-                    raise RuntimeError("Unsupported Phonon tensor format")
-            if file.read(1):
-                raise RuntimeError("Unexpected trailing Phonon weights")
-        return tensors, raw
+    def _load_weights(self, path, cache_dir):
+        cache = _cache_path(path, cache_dir)
+        if cache is not None and cache.is_file():
+            try:
+                arrays = _read_cache(cache)
+                self.cache_hit = True
+                return _split_arrays(arrays)
+            except Exception:
+                _remove(cache)
+        matrices, tensors, raw = _decode_weights(path)
+        if cache is not None:
+            _write_cache(cache, _join_arrays(matrices, tensors, raw))
+        return matrices, tensors, raw
 
-    def _create_matrix(self, record):
-        sign = record["sign"]
-        rows, columns = sign.shape
-        def pack(values):
-            values = values.astype(np.uint8).reshape(rows, columns // 4, 4)
-            return np.ascontiguousarray(values[:, :, 0] | values[:, :, 1] << 2 | values[:, :, 2] << 4 | values[:, :, 3] << 6)
-        first = pack(sign + 1)
-        second = pack(1 + sign * record["is_hi"].astype(np.int8))
-        low, high = np.ascontiguousarray(record["lo"]), np.ascontiguousarray(record["hi"])
-        handle = self.enc_lib.phonon2_cpu_create(rows, columns, first.ctypes.data, second.ctypes.data, low.ctypes.data, high.ctypes.data, 0)
-        if not handle:
+    def _create_matrices(self, records):
+        # ctypes releases the GIL, so the native packing work runs in parallel.
+        def create(item):
+            name, record = item
+            rows, columns = record["rows"], record["columns"]
+            handle = self.enc_lib.phonon2_cpu_create(
+                rows, columns, record["first"].ctypes.data, record["second"].ctypes.data,
+                record["lo"].ctypes.data, record["hi"].ctypes.data, 0)
+            if handle:
+                self.enc_lib.phonon2_cpu_enable_onedot(handle)
+            return name, handle
+        with ThreadPoolExecutor(max_workers=_workers()) as pool:
+            results = list(pool.map(create, records.items()))
+        for name, handle in results:
+            if handle:
+                self.matrices[name] = handle
+        if len(self.matrices) != len(records):
             raise RuntimeError("Could not allocate Phonon matrix")
-        self.enc_lib.phonon2_cpu_enable_onedot(handle)
-        self.matrix_data.extend([first, second, low, high])
-        return handle
 
     def _create_encoder(self, tensors):
         cfg = self.config["encoder"]
@@ -144,15 +149,15 @@ class Engine:
         keep = []
         def quantized(name):
             record = raw[name]
-            return [np.ascontiguousarray(record["q"]), np.ascontiguousarray(record["scale"], dtype=np.float16)]
+            return [np.array(record["q"], dtype=np.int8, order="C"), np.array(record["scale"], dtype=np.float16, order="C")]
         keep.extend(quantized("decoder.embedding.weight"))
         for index in [0, 1]:
             for side in ["ih", "hh"]:
                 keep.extend(quantized(f"decoder.lstm.weight_{side}_l{index}"))
-                keep.append(np.ascontiguousarray(tensors[f"decoder.lstm.bias_{side}_l{index}"], dtype=np.float16))
+                keep.append(np.array(tensors[f"decoder.lstm.bias_{side}_l{index}"], dtype=np.float16, order="C"))
         for name in ["decoder.decoder_projector", "joint.head"]:
             keep.extend(quantized(name + ".weight"))
-            keep.append(np.ascontiguousarray(tensors[name + ".bias"], dtype=np.float16))
+            keep.append(np.array(tensors[name + ".bias"], dtype=np.float16, order="C"))
         durations = self.config["decoding"]["durations"]
         self.durations = (ctypes.c_int * len(durations))(*durations)
         self.decoder = self.tdt_lib.phonon2_tdt_create(keep[0].shape[0], keep[0].shape[1], raw["decoder.lstm.weight_hh_l0"]["q"].shape[1], raw["joint.head.weight"]["q"].shape[0], len(durations), ctypes.addressof(self.durations), len(self.vocabulary), 10, *[array.ctypes.data for array in keep])
@@ -219,7 +224,6 @@ class Engine:
         for handle in self.matrices.values():
             self.enc_lib.phonon2_cpu_destroy(handle)
         self.matrices.clear()
-        self.matrix_data.clear()
         self.decoder_data = []
 
 
@@ -235,3 +239,182 @@ def mel_filters():
     weights = np.maximum(0, np.minimum(-ramps[:-2] / differences[:-1, None], ramps[2:] / differences[1:, None]))
     weights *= (2 / (centers[2:] - centers[:-2]))[:, None]
     return weights.astype(np.float32)
+
+
+# Each container byte holds five base-3 digits ("trits"); this table expands every byte value at once.
+_TRITS = (np.arange(256, dtype=np.uint16)[:, None] // (3 ** np.arange(5, dtype=np.uint16)) % 3).astype(np.uint8)
+
+
+def _pack(values, rows, columns):
+    values = values.reshape(rows, columns // 4, 4)
+    return np.ascontiguousarray(values[:, :, 0] | values[:, :, 1] << 2 | values[:, :, 2] << 4 | values[:, :, 3] << 6)
+
+
+def _five_value_planes(blob, shape):
+    """Decode one five-value matrix straight into the two packed planes the native library expects.
+
+    Equivalent to fermion_container._five_value followed by packing (sign + 1) and (1 + sign * is_hi),
+    without building the dense float16 matrix."""
+    rows, columns = shape
+    row_bytes = (columns + 4) // 5
+    codes = _TRITS[np.frombuffer(blob, dtype=np.uint8, count=rows * row_bytes)]
+    codes = codes.reshape(rows, row_bytes * 5)[:, :columns]
+    nonzero = codes != 1
+    count = int(np.count_nonzero(nonzero))
+    offset = rows * row_bytes
+    high_bytes = (count + 7) // 8
+    bits = np.unpackbits(np.frombuffer(blob, dtype=np.uint8, count=high_bytes, offset=offset), bitorder="little")[:count]
+    offset += high_bytes
+    if offset + 4 * rows != len(blob):
+        raise RuntimeError("Invalid Phonon matrix")
+    second = np.ones((rows, columns), dtype=np.uint8)
+    second[nonzero] = np.where(bits.astype(bool), codes[nonzero], 1)
+    return {
+        "first": _pack(codes, rows, columns),
+        "second": _pack(second, rows, columns),
+        "lo": np.frombuffer(blob, dtype=np.float16, count=rows, offset=offset).copy(),
+        "hi": np.frombuffer(blob, dtype=np.float16, count=rows, offset=offset + 2 * rows).copy(),
+        "rows": rows, "columns": columns,
+    }
+
+
+def _decode_weights(path):
+    matrices, tensors, raw = {}, {}, {}
+    pending = []
+    with open(path, "rb") as file:
+        header_size = int.from_bytes(file.read(8), "little")
+        header = json.loads(file.read(header_size))
+        if header["format"] != container.FORMAT:
+            raise RuntimeError("Unsupported Phonon model format")
+        for entry in header["index"]:
+            blob = file.read(entry["b"])
+            if len(blob) != entry["b"]:
+                raise RuntimeError("Truncated Phonon weights")
+            name, kind, shape = entry["n"], entry["k"], tuple(entry["shape"])
+            if kind == "five_value":
+                pending.append((name, blob, shape))
+            elif kind.startswith("int"):
+                record = {}
+                tensors[name] = container._intn(blob, shape, int(kind[3:]), record)
+                raw[name] = {"q": record["q"], "scale": record["scale"]}
+            elif kind == "fp16":
+                tensors[name] = np.frombuffer(blob, dtype=np.float16).reshape(shape).copy()
+            else:
+                raise RuntimeError("Unsupported Phonon tensor format")
+        if file.read(1):
+            raise RuntimeError("Unexpected trailing Phonon weights")
+    # NumPy releases the GIL for these array operations, so matrices decode in parallel.
+    with ThreadPoolExecutor(max_workers=_workers()) as pool:
+        decoded = pool.map(lambda item: (item[0], _five_value_planes(item[1], item[2])), pending)
+        matrices.update(decoded)
+    return matrices, tensors, raw
+
+
+def _workers():
+    return max(1, min(8, os.cpu_count() or 1))
+
+
+def _join_arrays(matrices, tensors, raw):
+    arrays = {}
+    for name, record in matrices.items():
+        for part in ["first", "second", "lo", "hi"]:
+            arrays[f"m\0{name}\0{part}"] = record[part]
+    for name, tensor in tensors.items():
+        arrays[f"t\0{name}"] = tensor
+    for name, record in raw.items():
+        for part in ["q", "scale"]:
+            arrays[f"r\0{name}\0{part}"] = record[part]
+    return arrays
+
+
+def _split_arrays(arrays):
+    matrices, tensors, raw = {}, {}, {}
+    for key, array in arrays.items():
+        kind, *rest = key.split("\0")
+        if kind == "m":
+            record = matrices.setdefault(rest[0], {})
+            record[rest[1]] = array
+            if rest[1] == "first":
+                record["rows"], record["columns"] = array.shape[0], array.shape[1] * 4
+        elif kind == "t":
+            tensors[rest[0]] = array
+        elif kind == "r":
+            raw.setdefault(rest[0], {})[rest[1]] = array
+        else:
+            raise RuntimeError("Unexpected Phonon cache entry")
+    for record in matrices.values():
+        if set(record) != {"first", "second", "lo", "hi", "rows", "columns"}:
+            raise RuntimeError("Incomplete Phonon cache entry")
+    return matrices, tensors, raw
+
+
+def _cache_path(model, cache_dir):
+    if not cache_dir:
+        return None
+    try:
+        status = os.stat(model)
+        with open(model, "rb") as file:
+            # The container header indexes every tensor's name, kind, shape, and size.
+            header = file.read(8 + int.from_bytes(file.read(8), "little"))
+        directory = Path(cache_dir)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    except OSError:
+        return None
+    digest = hashlib.sha256(header + str((status.st_size, status.st_mtime_ns)).encode()).hexdigest()[:24]
+    return directory / f"phonon2-v{CACHE_VERSION}-{digest}.weights"
+
+
+def _remove(path):
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def _write_cache(path, arrays):
+    """Atomically write arrays as a 64-byte-aligned flat file with a JSON index. Failures are ignored."""
+    index, offset = [], 0
+    for key, array in arrays.items():
+        array = np.ascontiguousarray(array)
+        offset = (offset + 63) // 64 * 64
+        index.append({"k": key, "d": array.dtype.str, "s": list(array.shape), "o": offset})
+        offset += array.nbytes
+    header = json.dumps({"version": CACHE_VERSION, "index": index, "data_bytes": offset}).encode()
+    data_start = (16 + len(header) + 63) // 64 * 64
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(temporary, "wb") as file:
+            file.write(CACHE_MAGIC + len(header).to_bytes(8, "little") + header)
+            for entry, array in zip(index, arrays.values()):
+                file.seek(data_start + entry["o"])
+                file.write(np.ascontiguousarray(array).tobytes())
+            file.truncate(data_start + offset)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+        for stale in path.parent.glob("phonon2-v*.weights"):
+            if stale != path:
+                _remove(stale)
+    except OSError:
+        _remove(temporary)
+
+
+def _read_cache(path):
+    with open(path, "rb") as file:
+        mapping = mmap.mmap(file.fileno(), 0, access=mmap.ACCESS_READ)
+    if mapping[:8] != CACHE_MAGIC:
+        raise RuntimeError("Invalid Phonon cache")
+    header_size = int.from_bytes(mapping[8:16], "little")
+    header = json.loads(mapping[16:16 + header_size])
+    data_start = (16 + header_size + 63) // 64 * 64
+    if header["version"] != CACHE_VERSION or len(mapping) != data_start + header["data_bytes"]:
+        raise RuntimeError("Invalid Phonon cache")
+    arrays = {}
+    for entry in header["index"]:
+        dtype = np.dtype(entry["d"])
+        count = int(np.prod(entry["s"], dtype=np.int64))
+        if entry["o"] + count * dtype.itemsize > header["data_bytes"]:
+            raise RuntimeError("Invalid Phonon cache")
+        arrays[entry["k"]] = np.frombuffer(mapping, dtype=dtype, count=count,
+                                           offset=data_start + entry["o"]).reshape(entry["s"])
+    return arrays

@@ -8,7 +8,7 @@ private final class DictationPanel: NSPanel {
 final class RecordingPanel {
     private let panel: DictationPanel
     private let title = NSTextField(labelWithString: "Recording…")
-    private let detail = NSTextField(labelWithString: "Fn-Control to stop and paste")
+    private let detail = NSTextField(labelWithString: "Fn-Control to paste · Esc to cancel")
     private let caption = NSTextField(labelWithString: "Live preview · last 20 seconds")
     private let placeholder = NSTextField(labelWithString: "Speak to see a live preview…")
     private let preview = NSTextView()
@@ -69,7 +69,7 @@ final class RecordingPanel {
 
     func showRecording() {
         title.stringValue = "Recording…"
-        detail.stringValue = "Fn-Control to stop and paste"
+        detail.stringValue = "Fn-Control to paste · Esc to cancel"
         caption.stringValue = "Live preview · last 20 seconds"
         placeholder.stringValue = "Speak to see a live preview…"
         placeholder.isHidden = false
@@ -93,7 +93,7 @@ final class RecordingPanel {
 
     func showProcessing() {
         title.stringValue = "Transcribing locally…"
-        detail.stringValue = "Finishing the full recording"
+        detail.stringValue = "Finishing the full recording · Esc to cancel"
         caption.stringValue = "Preparing the final transcript…"
         placeholder.stringValue = "Preparing the final transcript…"
         icon.image = NSImage(systemSymbolName: "waveform", accessibilityDescription: "Transcribing")

@@ -58,6 +58,8 @@ enum SelfTest {
             checks["paste_event_posted"] = posted
             guard posted else { throw TestError.failed("Allow automatic insertion before testing paste") }
         }
+        checks["cancellation"] = try AppController.testCancellation(sample: sample)
+        guard Insertion.copy(transcript) else { throw TestError.failed("Could not restore the generated test transcript") }
         let temporaryProbe = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try Data("private temporary file".utf8).write(to: temporaryProbe)
         try FileManager.default.removeItem(at: temporaryProbe)

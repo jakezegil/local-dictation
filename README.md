@@ -4,7 +4,8 @@ A Mac menu bar app for offline English dictation with [Phonon 2](https://www.fer
 
 Press **Fn-Control** to open the recording box and see a live transcript preview.
 Press it again to finish the full transcript, close the box, and paste.
-Your transcript also stays on the clipboard. If no text field is focused, paste later with **Command-V**.
+Press **Escape** to cancel recording or final transcription without copying or pasting.
+Your completed transcript also stays on the clipboard. If no text field is focused, paste later with **Command-V**.
 
 ## Install
 
@@ -31,7 +32,8 @@ You can [read the installer](install.sh) or [download the release](https://githu
 5. Focus a text field.
 6. Press **Fn-Control**, speak, and press **Fn-Control** again.
 
-The model takes about 15 seconds to load on the tested Mac. Later recordings use the loaded model.
+The first launch prepares the model in about 2 seconds and caches the decoded weights in the app's container.
+Later launches load in under a second. Recordings use the loaded model.
 The recording box leaves your text field focused. Its preview refreshes about once a second with the last 20 seconds.
 Preview text may change as you speak. The final transcript includes the full recording.
 Only one preview runs at a time. Recordings stop automatically after ten minutes.
@@ -49,13 +51,16 @@ Both the app and its speech worker use **macOS App Sandbox without network entit
 Installation needs internet access. Recording and transcription run locally without an internet connection.
 
 The app has no document, selected-text, screen, or clipboard context features.
-The shortcut observes modifier changes only. It does not capture typed characters.
+The Fn-Control shortcut observes modifier changes only. Escape is registered only while dictation can be cancelled.
+The app does not capture typed characters.
 The app remembers the active application without inspecting its contents.
 Automatic insertion restores that application and posts **Command-V** after you release the shortcut.
 
 Audio and preview snapshots stay in the app's private temporary directory.
 The app deletes each preview snapshot after use and deletes the full recording after transcription, including failures.
 The app removes abandoned recordings when it starts. The last transcript stays in memory until you quit.
+Decoded model weights (about 420 MB) are cached in `~/Library/Containers/local.jake.dictation/Data/Library/Caches`.
+They contain no audio or transcripts, and the app rebuilds them if they are removed.
 The system clipboard retains the transcript. Other clipboard tools may read or sync it.
 
 Accessibility permission enables the shortcut and automatic insertion. This permission has broader system capabilities.
@@ -115,6 +120,8 @@ printf 'sandbox probe\n' > sandbox-probe.txt
 The self-test transcribes a bundled generated speech sample and checks clipboard output.
 It checks live preview transcription before the recording closes, microphone-format resampling, and the bounded preview window.
 It verifies that the complete recording remains available for the final transcript.
+It checks that a recording continues when the input device changes format partway through.
+It tests Escape cancellation, audio deletion, unchanged clipboard output, and rejection of late cancelled results.
 It checks that both processes deny network access and access to the unrelated probe file.
 It reports event-posting permission separately and replaces the clipboard with the sample transcript.
 The Fn-Control toggle and automatic insertion have also been confirmed during normal use.

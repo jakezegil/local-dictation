@@ -1,6 +1,9 @@
 import AppKit
 import Foundation
 
+// Writing to a speech worker that has just exited must surface as an error, not terminate the app.
+signal(SIGPIPE, SIG_IGN)
+
 if let position = CommandLine.arguments.firstIndex(of: "--self-test") {
     do {
         guard CommandLine.arguments.count > position + 1 else {

@@ -1,5 +1,6 @@
 import AppKit
 import AVFoundation
+import Carbon
 
 final class AppController: NSObject, NSApplicationDelegate {
     private let recorder = Recorder()
@@ -7,18 +8,23 @@ final class AppController: NSObject, NSApplicationDelegate {
     private let recordingPanel = RecordingPanel()
     private var insertionTarget: NSRunningApplication?
     private var hotKey: HotKey?
+    private lazy var escapeKey = EscapeKey { [weak self] in self?.cancelDictation() }
     private var statusItem: NSStatusItem!
     private let stateItem = NSMenuItem(title: "Ready — press Fn-Control", action: nil, keyEquivalent: "")
     private let recordItem = NSMenuItem(title: "Start Recording", action: #selector(toggleRecording), keyEquivalent: "")
+    private let cancelItem = NSMenuItem(title: "Cancel Dictation", action: #selector(cancelDictation), keyEquivalent: "")
     private let copyItem = NSMenuItem(title: "Copy Last Transcript", action: #selector(copyLastTranscript), keyEquivalent: "")
     private let insertItem = NSMenuItem(title: "Automatic Insertion", action: #selector(toggleInsertion), keyEquivalent: "")
     private var processing = false
+    private var transcriptionID: UUID?
+    private var transcribingAudio: URL?
     private var lastTranscript: String?
     private var limitTimer: Timer?
     private var previewTimer: Timer?
     private var recordingID: UUID?
     private var previewInFlight = false
     private var permissionWindow: NSWindow?
+    private var dictationActivity: NSObjectProtocol?
     private var automaticInsertion: Bool {
         get { UserDefaults.standard.object(forKey: "automaticInsertion") as? Bool ?? true }
         set { UserDefaults.standard.set(newValue, forKey: "automaticInsertion") }
@@ -27,11 +33,11 @@ final class AppController: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         configureMenu()
-        do {
-            try recorder.removeAbandonedRecordings()
-            hotKey = HotKey { [weak self] in self?.toggleRecording() }
-            hotKey?.register()
-        } catch { showError(error) }
+        // Register the shortcut first and independently, so a cleanup failure can never leave it disabled.
+        hotKey = HotKey { [weak self] in self?.toggleRecording() }
+        hotKey?.register()
+        observeShortcutAvailability()
+        try? recorder.removeAbandonedRecordings()
         updateStatus("Loading local model…", symbol: "waveform")
         transcriber.prepare { [weak self] result in
             guard let self else { return }
@@ -49,6 +55,34 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
+    /// Global event monitors created before Accessibility trust is granted, or across a sleep, can stay silent.
+    /// Re-create the monitor whenever either changes.
+    private func observeShortcutAvailability() {
+        DistributedNotificationCenter.default().addObserver(
+            forName: NSNotification.Name("com.apple.accessibility.api"), object: nil, queue: .main
+        ) { [weak self] _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { self?.hotKey?.register() }
+        }
+        for name in [NSWorkspace.didWakeNotification, NSWorkspace.sessionDidBecomeActiveNotification] {
+            NSWorkspace.shared.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                guard let self, !self.recorder.isRecording else { return }
+                self.hotKey?.register()
+            }
+        }
+    }
+
+    private func beginDictationActivity() {
+        guard dictationActivity == nil else { return }
+        // Keeps App Nap from throttling the preview timer and the speech worker during dictation.
+        dictationActivity = ProcessInfo.processInfo.beginActivity(
+            options: [.userInitiated, .idleSystemSleepDisabled], reason: "Dictation in progress")
+    }
+
+    private func endDictationActivity() {
+        if let dictationActivity { ProcessInfo.processInfo.endActivity(dictationActivity) }
+        dictationActivity = nil
+    }
+
     private func configureMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         let menu = NSMenu()
@@ -56,11 +90,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         stateItem.isEnabled = false
         menu.addItem(stateItem)
         menu.addItem(.separator())
-        for item in [recordItem, copyItem, insertItem] {
+        for item in [recordItem, cancelItem, copyItem, insertItem] {
             item.target = self
             menu.addItem(item)
         }
         copyItem.isEnabled = false
+        cancelItem.isEnabled = false
         insertItem.state = automaticInsertion ? .on : .off
         menu.addItem(.separator())
         let permissions = NSMenuItem(title: "Permissions…", action: #selector(showPermissions), keyEquivalent: "")
@@ -88,10 +123,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         do {
             insertionTarget = NSWorkspace.shared.frontmostApplication
             try recorder.start()
+            transcriber.warm()
+            beginDictationActivity()
+            try escapeKey.register()
             recordingID = UUID()
             previewInFlight = false
             recordingPanel.showRecording()
             recordItem.title = "Stop Recording"
+            cancelItem.isEnabled = true
             updateStatus("Recording — press Fn-Control to stop", symbol: "mic.fill")
             limitTimer = Timer.scheduledTimer(withTimeInterval: 600, repeats: false) { [weak self] _ in
                 self?.stopRecording()
@@ -99,7 +138,12 @@ final class AppController: NSObject, NSApplicationDelegate {
             previewTimer = Timer.scheduledTimer(withTimeInterval: 1.1, repeats: true) { [weak self] _ in
                 self?.refreshPreview()
             }
-        } catch { showError(error) }
+        } catch {
+            try? recorder.cancel()
+            escapeKey.stop()
+            endDictationActivity()
+            showError(error)
+        }
     }
 
     private func refreshPreview() {
@@ -134,53 +178,141 @@ final class AppController: NSObject, NSApplicationDelegate {
             url = recording
         } catch {
             recordItem.title = "Start Recording"
+            cancelItem.isEnabled = false
+            escapeKey.stop()
+            endDictationActivity()
             showError(error)
             return
         }
         processing = true
+        let id = UUID()
+        transcriptionID = id
+        transcribingAudio = url
         recordItem.title = "Start Recording"
         recordItem.isEnabled = false
         updateStatus("Transcribing locally…", symbol: "waveform")
         recordingPanel.showProcessing()
         transcriber.transcribe(url, removingAudio: true) { [weak self] result in
-            guard let self else { return }
-            self.recordItem.isEnabled = true
-            self.recordingPanel.close()
-            switch result {
-            case .failure(let error):
+            self?.finishTranscription(result, id: id)
+        }
+    }
+
+    private func finishTranscription(_ result: Result<String, Error>, id: UUID) {
+        guard transcriptionID == id else { return }
+        transcriptionID = nil
+        transcribingAudio = nil
+        escapeKey.stop()
+        endDictationActivity()
+        cancelItem.isEnabled = false
+        recordItem.isEnabled = true
+        recordingPanel.close()
+        switch result {
+        case .failure(let error):
+            self.processing = false
+            self.showError(error)
+        case .success(let transcript):
+            guard !transcript.isEmpty else {
                 self.processing = false
-                self.showError(error)
-            case .success(let transcript):
-                guard !transcript.isEmpty else {
-                    self.processing = false
-                    self.updateStatus("No speech detected — press Fn-Control", symbol: "mic")
-                    return
-                }
-                self.lastTranscript = transcript
-                self.copyItem.isEnabled = true
-                guard Insertion.copy(transcript) else {
-                    self.processing = false
-                    self.showError(NSError(domain: "LocalDictation", code: 1, userInfo: [
-                        NSLocalizedDescriptionKey: "The transcript could not be copied to the clipboard."
-                    ]))
-                    return
-                }
-                guard self.automaticInsertion else {
-                    self.processing = false
-                    self.updateStatus("Copied — paste with ⌘V", symbol: "mic")
-                    return
-                }
-                guard Insertion.isAllowed else {
-                    self.processing = false
-                    self.updateStatus("Copied — enable Accessibility to paste", symbol: "mic")
-                    self.showPermissions()
-                    return
-                }
-                Insertion.paste(into: self.insertionTarget) { pasted in
-                    self.processing = false
-                    self.updateStatus(pasted ? "Ready — press Fn-Control" : "Copied — paste with ⌘V", symbol: "mic")
-                }
+                self.updateStatus("No speech detected — press Fn-Control", symbol: "mic")
+                return
             }
+            self.lastTranscript = transcript
+            self.copyItem.isEnabled = true
+            guard Insertion.copy(transcript) else {
+                self.processing = false
+                self.showError(NSError(domain: "LocalDictation", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "The transcript could not be copied to the clipboard."
+                ]))
+                return
+            }
+            guard self.automaticInsertion else {
+                self.processing = false
+                self.updateStatus("Copied — paste with ⌘V", symbol: "mic")
+                return
+            }
+            guard Insertion.isAllowed else {
+                self.processing = false
+                self.updateStatus("Copied — enable Accessibility to paste", symbol: "mic")
+                self.showPermissions()
+                return
+            }
+            Insertion.paste(into: self.insertionTarget) { pasted in
+                self.processing = false
+                self.updateStatus(pasted ? "Ready — press Fn-Control" : "Copied — paste with ⌘V", symbol: "mic")
+            }
+        }
+    }
+
+    static func testCancellation(sample: URL) throws -> [String: Any] {
+        NSApplication.shared.setActivationPolicy(.accessory)
+        let controller = AppController()
+        controller.configureMenu()
+        let marker = "Generated cancellation test marker"
+        guard Insertion.copy(marker) else { throw DictationError.transcriptionFailed }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("LocalDictationRecordings", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
+                                               attributes: [.posixPermissions: 0o700])
+        let audio = directory.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
+        try FileManager.default.copyItem(at: sample, to: audio)
+        defer {
+            controller.escapeKey.stop()
+            controller.recordingPanel.close()
+            NSStatusBar.system.removeStatusItem(controller.statusItem)
+            try? FileManager.default.removeItem(at: audio)
+        }
+        let id = UUID()
+        controller.processing = true
+        controller.transcriptionID = id
+        controller.transcribingAudio = audio
+        try controller.escapeKey.register()
+        var event: EventRef?
+        guard CreateEvent(nil, OSType(kEventClassKeyboard), UInt32(kEventHotKeyPressed),
+                          GetCurrentEventTime(), 0, &event) == noErr, let event else {
+            throw DictationError.recordingFailed
+        }
+        defer { ReleaseEvent(event) }
+        var identifier = EventHotKeyID(signature: 0x4c444553, id: 1)
+        guard SetEventParameter(event, EventParamName(kEventParamDirectObject), EventParamType(typeEventHotKeyID),
+                                MemoryLayout<EventHotKeyID>.size, &identifier) == noErr,
+              SendEventToEventTarget(event, GetApplicationEventTarget()) == noErr,
+              !controller.processing, controller.transcriptionID == nil,
+              !FileManager.default.fileExists(atPath: audio.path) else { throw DictationError.recordingFailed }
+        controller.finishTranscription(.success("This cancelled output must never be pasted."), id: id)
+        guard NSPasteboard.general.string(forType: .string) == marker,
+              controller.lastTranscript == nil else { throw DictationError.transcriptionFailed }
+        let probe = EscapeKey {}
+        try probe.register()
+        probe.stop()
+        return ["escape_shortcut_passed": true, "cancelled_audio_deleted": true,
+                "late_transcript_discarded": true, "clipboard_unchanged_on_cancel": true,
+                "escape_released_when_idle": true]
+    }
+
+    @objc private func cancelDictation() {
+        guard recorder.isRecording || transcriptionID != nil else { return }
+        stopPreview()
+        limitTimer?.invalidate()
+        limitTimer = nil
+        transcriptionID = nil
+        processing = false
+        escapeKey.stop()
+        endDictationActivity()
+        cancelItem.isEnabled = false
+        recordItem.title = "Start Recording"
+        recordItem.isEnabled = true
+        insertionTarget = nil
+        recordingPanel.close()
+        do {
+            try recorder.cancel()
+            if let url = transcribingAudio, FileManager.default.fileExists(atPath: url.path) {
+                try FileManager.default.removeItem(at: url)
+            }
+            transcribingAudio = nil
+            updateStatus("Cancelled — press Fn-Control", symbol: "mic")
+        } catch {
+            transcribingAudio = nil
+            showError(error)
         }
     }
 
@@ -205,7 +337,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         title.frame = NSRect(x: 24, y: 196, width: 390, height: 30)
         content.addSubview(title)
         let description = NSTextField(wrappingLabelWithString:
-            "Press Fn-Control to start. Press it again to transcribe and paste. Enable Accessibility for the shortcut and automatic insertion. Your transcript stays on the clipboard."
+            "Fn-Control starts recording and finishes with paste. Escape cancels. Enable Accessibility for the shortcut and automatic insertion. Your transcript stays on the clipboard."
         )
         description.frame = NSRect(x: 24, y: 128, width: 390, height: 58)
         content.addSubview(description)
@@ -260,6 +392,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         stopPreview()
         limitTimer?.invalidate()
         hotKey?.stop()
+        escapeKey.stop()
         transcriber.shutdown()
         NSApp.terminate(nil)
     }
@@ -278,6 +411,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         stopPreview()
         limitTimer?.invalidate()
         hotKey?.stop()
+        escapeKey.stop()
         transcriber.shutdown()
         try? recorder.cancel()
     }

@@ -6,20 +6,30 @@ final class AudioCapture {
     let url: URL
     private(set) var failure: Error?
     private let format = AVAudioFormat(standardFormatWithSampleRate: 16_000, channels: 1)!
-    private let converter: AVAudioConverter
+    // Built from each buffer's actual format, so a device switch mid-recording gets a matching converter.
+    private var converter: AVAudioConverter?
     private var file: AVAudioFile?
     private var recentSamples: [Float] = []
     private var frames: Int64 = 0
     private var previewFrames: Int64 = 0
 
-    init(inputFormat: AVAudioFormat, directory: URL) throws {
+    var frameCount: Int64 { frames }
+
+    init(directory: URL) throws {
         url = directory.appendingPathComponent(UUID().uuidString).appendingPathExtension("wav")
-        guard let converter = AVAudioConverter(from: inputFormat, to: format) else {
-            throw DictationError.recordingFailed
-        }
-        self.converter = converter
-        converter.primeMethod = .none
         file = try Self.makeFile(at: url)
+    }
+
+    func fail(_ error: Error) {
+        if failure == nil { failure = error }
+    }
+
+    private func converter(for input: AVAudioFormat) throws -> AVAudioConverter {
+        if let converter, converter.inputFormat == input { return converter }
+        guard let converter = AVAudioConverter(from: input, to: format) else { throw DictationError.recordingFailed }
+        converter.primeMethod = .none
+        self.converter = converter
+        return converter
     }
 
     static func copy(_ buffer: AVAudioPCMBuffer) -> AVAudioPCMBuffer? {
@@ -43,6 +53,7 @@ final class AudioCapture {
             guard let converted = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: capacity) else {
                 throw DictationError.recordingFailed
             }
+            let converter = try converter(for: buffer.format)
             var supplied = false
             var error: NSError?
             let status = converter.convert(to: converted, error: &error) { _, state in

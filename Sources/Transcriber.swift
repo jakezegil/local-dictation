@@ -16,11 +16,15 @@ enum DictationError: LocalizedError {
 }
 
 final class Transcriber {
+    /// Recordings stop at ten minutes; allow a few seconds of slack for the stop to land.
+    static let maximumSeconds = 610
     private let queue = DispatchQueue(label: "local-dictation.transcription", qos: .userInitiated)
     private var worker: Process?
     private var input: FileHandle?
     private var output: FileHandle?
     private var pending = Data()
+    private var stopping = false
+    private var lastRestart = Date.distantPast
 
     deinit { closeWorker() }
 
@@ -31,10 +35,18 @@ final class Transcriber {
         }
     }
 
+    /// Pages model weights back into memory (macOS swaps them out while idle) while the user is still speaking.
+    func warm() {
+        queue.async { _ = try? self.request(["command": "warm"]) }
+    }
+
     func transcribe(_ url: URL, removingAudio: Bool = false, completion: @escaping (Result<String, Error>) -> Void) {
         queue.async {
+            let activity = ProcessInfo.processInfo.beginActivity(
+                options: [.userInitiated, .idleSystemSleepDisabled], reason: "Transcribing dictation")
+            defer { ProcessInfo.processInfo.endActivity(activity) }
             var result = Result { try self.transcribeSynchronously(url) }
-            if removingAudio {
+            if removingAudio, FileManager.default.fileExists(atPath: url.path) {
                 do { try FileManager.default.removeItem(at: url) }
                 catch { result = .failure(error) }
             }
@@ -45,17 +57,36 @@ final class Transcriber {
     private func startWorker() throws {
         if worker?.isRunning == true { return }
         closeWorker()
+        stopping = false
         guard let resources = Bundle.main.resourceURL else { throw DictationError.unavailableModel }
         let process = Process()
         process.executableURL = resources.appendingPathComponent("Python/bin/python3.12")
         process.arguments = ["-I", "-B", resources.appendingPathComponent("PhononRuntime/worker.py").path]
-        process.environment = [
+        var environment = [
             "TMPDIR": FileManager.default.temporaryDirectory.path,
             "PYTHONDONTWRITEBYTECODE": "1",
             "OPENBLAS_NUM_THREADS": "1",
             "VECLIB_MAXIMUM_THREADS": "4"
         ]
+        // Decoded weights are cached in the app's sandbox container so later launches skip decoding.
+        if let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            environment["LOCAL_DICTATION_CACHE"] = caches.appendingPathComponent("PhononWeights", isDirectory: true).path
+        }
+        process.environment = environment
+        process.qualityOfService = .userInitiated
         process.currentDirectoryURL = resources
+        // If the worker dies while idle, restart it right away so the next dictation does not wait for a load.
+        process.terminationHandler = { [weak self] ended in
+            guard let self else { return }
+            self.queue.async {
+                guard self.worker === ended, !self.stopping else { return }
+                self.closeWorker()
+                // A worker that keeps crashing is restarted on the next request instead of in a loop.
+                guard Date().timeIntervalSince(self.lastRestart) > 30 else { return }
+                self.lastRestart = Date()
+                try? self.startWorker()
+            }
+        }
         let writePipe = Pipe(), readPipe = Pipe()
         process.standardInput = writePipe
         process.standardOutput = readPipe
@@ -100,7 +131,7 @@ final class Transcriber {
     func transcribeSynchronously(_ url: URL) throws -> String {
         let file = try AVAudioFile(forReading: url)
         guard file.processingFormat.sampleRate == 16_000, file.processingFormat.channelCount == 1,
-              file.length >= 0, file.length <= 16_000 * 600 else { throw DictationError.invalidAudio }
+              file.length >= 0, file.length <= Int64(16_000 * Self.maximumSeconds) else { throw DictationError.invalidAudio }
         guard file.length >= 4_000 else { return "" }
         guard let text = try request(["audio": url.path])["text"] as? String else {
             throw DictationError.transcriptionFailed
@@ -113,14 +144,19 @@ final class Transcriber {
     }
 
     func shutdown() {
-        queue.sync { closeWorker() }
+        queue.sync {
+            stopping = true
+            closeWorker()
+        }
     }
 
     private func closeWorker() {
+        let ending = worker
+        worker = nil
+        ending?.terminationHandler = nil
         try? input?.close()
         try? output?.close()
-        if worker?.isRunning == true { worker?.terminate() }
-        worker = nil
+        if ending?.isRunning == true { ending?.terminate() }
         input = nil
         output = nil
         pending.removeAll()

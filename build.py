@@ -65,7 +65,7 @@ def main():
     subprocess.run([
         "/usr/bin/xcrun", "swiftc", "-swift-version", "5", "-O",
         "-target", "arm64-apple-macosx13.3", "-module-name", "LocalDictation",
-        "-framework", "AppKit", "-framework", "AVFoundation", "-framework", "ApplicationServices",
+        "-framework", "AppKit", "-framework", "AVFoundation", "-framework", "ApplicationServices", "-framework", "Carbon",
         "-o", str(contents / "MacOS" / "LocalDictation"), *map(str, sources)
     ], check=True)
     previous = None

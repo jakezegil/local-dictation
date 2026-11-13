@@ -23,7 +23,7 @@ enum PreviewTest {
             return source
         }
         guard status != .error else { throw conversionError ?? DictationError.invalidAudio as NSError }
-        let capture = try AudioCapture(inputFormat: hardwareFormat, directory: directory)
+        let capture = try AudioCapture(directory: directory)
         var previews: [URL] = []
         defer {
             capture.close()
@@ -68,6 +68,7 @@ enum PreviewTest {
         guard complete.length > window.length, abs(complete.length - input.length * 4) < 256 else {
             throw DictationError.invalidAudio
         }
+        let deviceSwitch = try deviceSwitchCheck(directory: directory, source: source)
         if CommandLine.arguments.contains("--preview-panel") {
             let target = NSWorkspace.shared.frontmostApplication?.processIdentifier
             let panel = RecordingPanel()
@@ -82,7 +83,8 @@ enum PreviewTest {
         }
         var checks: [String: Any] = ["live_preview_passed": true, "capture_resampling_passed": true,
                                    "preview_window_seconds": AudioCapture.previewSeconds,
-                                   "complete_recording_preserved": true, "preview_audio_deleted": true]
+                                   "complete_recording_preserved": true, "preview_audio_deleted": true,
+                                   "device_switch_mid_recording_passed": deviceSwitch]
         if CommandLine.arguments.contains("--microphone") {
             let recorder = Recorder()
             var files: [URL] = []
@@ -104,5 +106,38 @@ enum PreviewTest {
             checks["microphone_capture_passed"] = true
         }
         return checks
+    }
+
+    /// Feeds 48 kHz mono audio, then 44.1 kHz stereo audio, into one capture, as happens when the input device
+    /// changes during a recording. Both halves must be resampled into the same 16 kHz file.
+    private static func deviceSwitchCheck(directory: URL, source: AVAudioPCMBuffer) throws -> Bool {
+        let capture = try AudioCapture(directory: directory)
+        defer {
+            capture.close()
+            try? FileManager.default.removeItem(at: capture.url)
+        }
+        let formats = [AVAudioFormat(standardFormatWithSampleRate: 48_000, channels: 1)!,
+                       AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 2)!]
+        for format in formats {
+            let converter = AVAudioConverter(from: source.format, to: format)!
+            converter.primeMethod = .none
+            let ratio = format.sampleRate / source.format.sampleRate
+            let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(Double(source.frameLength) * ratio) + 64)!
+            var supplied = false
+            var error: NSError?
+            guard converter.convert(to: output, error: &error, withInputFrom: { _, state in
+                if supplied { state.pointee = .endOfStream; return nil }
+                supplied = true
+                state.pointee = .haveData
+                return source
+            }) != .error else { throw error ?? DictationError.invalidAudio as NSError }
+            guard let copy = AudioCapture.copy(output) else { throw DictationError.recordingFailed }
+            capture.append(copy)
+            if let failure = capture.failure { throw failure }
+        }
+        capture.close()
+        let complete = try AVAudioFile(forReading: capture.url)
+        guard abs(complete.length - Int64(source.frameLength) * 2) < 512 else { throw DictationError.invalidAudio }
+        return true
     }
 }
